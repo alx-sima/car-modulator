@@ -1,8 +1,9 @@
+#include <FMTX.h>
 #include <LiquidCrystal_I2C.h>
 
-#include <FMTX.h>
+#include "HardwareSerial.h"
 
-#define FREQ_SEL_BTN PC2
+#define FREQ_SEL_BTN PC2 // INT0
 
 #define FREQUENCY_PIN     PC3
 #define MIN_FREQ_ADC_READ 3
@@ -27,20 +28,33 @@ void print_freq_banner()
 	lcd.print(" MHz");
 }
 
+static inline void setup_adc(void)
+{
+	ADMUX |= (0b01 << REFS0); // AVcc with external capacitor at AREF pin
+
+	ADMUX |= (ADC3D << MUX0); // ADC3
+
+	ADCSRA |= (1 << ADATE); // auto trigger enable
+	ADCSRA |= (1 << ADIE);  // enable ADC interrupt
+	ADCSRA |= (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0); // prescaler 128
+
+	ADCSRB &= ~(0b111 << ADTS0); // free running mode
+}
+
 void setup(void)
 {
 	DDRC &= ~(1 << FREQUENCY_PIN);
-	DDRC &= ~(1 << FREQ_SEL_BTN);
+	DDRD &= ~(1 << FREQ_SEL_BTN);
 
-	/* Button pull-ups */
-	PORTC |= (1 << FREQ_SEL_BTN);
+	/* button pull-ups */
+	PORTD |= (1 << FREQ_SEL_BTN);
+
+	EICRA |= (1 << ISC01); // interrupt on falling edge
+	EIMSK |= (1 << INT0);  // enable INT0
+
+	setup_adc();
 
 	Serial.begin(9600);
-	Serial.print("FM-TX Demo\r\n");
-
-	Serial.print(PORTC);
-	Serial.print(" ");
-	Serial.print(DDRC);
 
 	lcd.init();
 	lcd.backlight();
@@ -52,8 +66,39 @@ void setup(void)
 int samples[64];
 int collected = 0;
 
+#define ADC_TOL 2
+
+volatile int adc_val = 0;
+
+ISR(ADC_vect)
+{
+	int new_adc_val = ADC;
+	if (abs(new_adc_val - adc_val) > ADC_TOL) {
+		adc_val = new_adc_val;
+		Serial.print("ADC: ");
+		Serial.print(ADC);
+		Serial.println();
+	}
+}
+
+ISR(INT0_vect)
+{
+	Serial.println("INT0");
+	Serial.println();
+}
+
 void loop(void)
 {
+	if (!(PINC & (1 << FREQ_SEL_BTN))) {
+		if (selecting) {
+			ADCSRA &= ~(1 << ADEN); // disable ADC
+		} else {
+			ADCSRA |= (1 << ADEN) | (1 << ADSC); // enable & start ADC
+		}
+		selecting = !selecting;
+	}
+
+	return;
 	if (selecting) {
 		lcd.setCursor(0, 1);
 		lcd.print(fm_set_freq);
@@ -96,45 +141,5 @@ void loop(void)
 		}
 
 		fm_set_freq = value / 10.0; // Convert to MHz
-	}
-	return;
-
-	if (Serial.available()) {
-		switch (Serial.read()) {
-		case '&':
-			u8 i, buf[4];
-			float ch;
-			i = 0;
-			delay(30);
-			while (Serial.available() && i < 4) {
-				buf[i] = Serial.read();
-				if (buf[i] <= '9' && buf[i] >= '0') {
-					i++;
-				} else {
-					i = 0;
-					break;
-				}
-			}
-			if (i == 4) {
-				ch = (buf[0] - '0') * 100 + (buf[1] - '0') * 10 +
-					 (buf[2] - '0') * 1 + 0.1 * (buf[3] - '0');
-				if (ch >= 70 && ch <= 108) {
-					Serial.print("New Channel:");
-					Serial.print(ch, 1);
-					Serial.println("MHz");
-					fmtx_set_freq(ch);
-				} else {
-					Serial.println(
-						"ERROR:Channel must be range from 70Mhz to 108Mhz.");
-				}
-			} else {
-				Serial.println("ERROR:Input Format Error.");
-			}
-
-			while (Serial.available()) {
-				Serial.read();
-			}
-			break;
-		}
 	}
 }
