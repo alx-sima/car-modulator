@@ -1,34 +1,53 @@
 #include <FMTX.h>
 #include <LiquidCrystal_I2C.h>
+#include <SD.h>
+#include <TMRpcm.h>
 
-#include "HardwareSerial.h"
-
-#define FREQ_SEL_BTN PC2 // INT0
-
-#define FREQUENCY_PIN     PC3
-#define MIN_FREQ_ADC_READ 3
-#define MAX_FREQ_ADC_READ (340 - MIN_FREQ_ADC_READ)
-#define MIN_FREQ          875
-#define MAX_FREQ          1080
+#include "button.hpp"
+#include "pinout.hpp"
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
+TMRpcm sd_player;
 
-bool selecting = false;
+static bool playing_bluetooth = true;
+static bool selecting_freq = false;
+static bool sd_card_error = false;
 
-float fm_set_freq = 90; // Here set the default FM frequency
-float fm_sel_freq = 90; // Here set the default FM frequency
+static float fm_set_freq = 90;
 
-void print_freq_banner()
+volatile float fm_sel_freq;
+volatile bool freq_changed = false;
+
+void print_freq_banner(void)
 {
 	lcd.clear();
 	lcd.setCursor(0, 0);
-	lcd.print("Playing on");
+	if (sd_card_error) {
+		lcd.print("[SD] Read error");
+		return;
+	}
+	
+	if (playing_bluetooth) 
+		lcd.print("[BT] Playing on");
+	else
+		lcd.print("[SD] Playing on");
+
 	lcd.setCursor(0, 1);
 	lcd.print(fm_set_freq);
 	lcd.print(" MHz");
 }
 
-static inline void setup_adc(void)
+void print_freq_select_banner(void)
+{
+	lcd.clear();
+	lcd.setCursor(0, 0);
+	lcd.print("Selecting freq:");
+	lcd.setCursor(0, 1);
+	lcd.print(fm_sel_freq);
+	lcd.print(" MHz");
+}
+
+static inline void adc_setup(void)
 {
 	ADMUX |= (0b01 << REFS0); // AVcc with external capacitor at AREF pin
 
@@ -41,105 +60,95 @@ static inline void setup_adc(void)
 	ADCSRB &= ~(0b111 << ADTS0); // free running mode
 }
 
+ISR(ADC_vect)
+{
+	float read_freq = map(ADC, MIN_FREQ_ADC_READ, MAX_FREQ_ADC_READ, MIN_FREQ, MAX_FREQ);
+	read_freq /= 10.0;
+
+	if (abs(read_freq - fm_sel_freq) >= 0.05) {
+		fm_sel_freq = read_freq;
+		freq_changed = true;
+	}	
+}
+
+void switch_play_mode(void) {
+	playing_bluetooth = !playing_bluetooth;
+	sd_card_error = false;
+	selecting_freq = false;
+
+	if (playing_bluetooth) {
+		PORTD |= (1 << BTH_ENABLE); // enable bluetooth
+		print_freq_banner();
+		sd_player.stopPlayback();
+		SD.end();
+		return;
+	} 
+	
+	if (SD.begin()) {
+		sd_player.play("test.wav");
+	} else {
+		sd_card_error = true;
+	}
+	print_freq_banner();
+}
+
+void toggle_freq_sel(void) {
+	selecting_freq = !selecting_freq;
+	if (selecting_freq) {
+		ADCSRA |= (1 << ADEN) | (1 << ADSC); // enable & start ADC
+		PORTD &= ~(1 << BTH_ENABLE); 		 // disable bluetooth
+		print_freq_select_banner();
+		return;
+	}
+
+	ADCSRA &= ~(1 << ADEN); // disable ADC
+	fm_set_freq = fm_sel_freq;
+	// fmtx_set_freq(fm_set_freq);
+	print_freq_banner();
+}
+
+
 void setup(void)
 {
-	DDRC &= ~(1 << FREQUENCY_PIN);
+	DDRC &= ~(1 << FREQ_SEL_KNOB);
 	DDRD &= ~(1 << FREQ_SEL_BTN);
+	DDRD |= (1 << BTH_ENABLE);
 
-	/* button pull-ups */
-	PORTD |= (1 << FREQ_SEL_BTN);
+	PORTD |= (1 << FREQ_SEL_BTN);	// button pull-up
+	PORTD |= (1 << BTH_ENABLE); 	// enable bluetooth
 
-	EICRA |= (1 << ISC01); // interrupt on falling edge
-	EIMSK |= (1 << INT0);  // enable INT0
+	EICRA |= (1 << ISC00);	// INT0 edge trigger
+	EICRA &= ~(1 << ISC01);	// 
+	EIMSK |= (1 << INT0);	// enable INT0
 
-	setup_adc();
+	adc_setup();
 
-	Serial.begin(9600);
+	Serial.begin(9600); // DEBUG
+	sei();
 
 	lcd.init();
 	lcd.backlight();
 	print_freq_banner();
 
-	fmtx_init(fm_set_freq, EUROPE);
+	sd_player.speakerPin = SD_PLAYER_SINK;
+
+	// fmtx_init(fm_set_freq, EUROPE);
 }
 
-int samples[64];
-int collected = 0;
-
-#define ADC_TOL 2
-
-volatile int adc_val = 0;
-
-ISR(ADC_vect)
-{
-	int new_adc_val = ADC;
-	if (abs(new_adc_val - adc_val) > ADC_TOL) {
-		adc_val = new_adc_val;
-		Serial.print("ADC: ");
-		Serial.print(ADC);
-		Serial.println();
-	}
-}
-
-ISR(INT0_vect)
-{
-	Serial.println("INT0");
-	Serial.println();
-}
 
 void loop(void)
 {
-	if (!(PINC & (1 << FREQ_SEL_BTN))) {
-		if (selecting) {
-			ADCSRA &= ~(1 << ADEN); // disable ADC
-		} else {
-			ADCSRA |= (1 << ADEN) | (1 << ADSC); // enable & start ADC
-		}
-		selecting = !selecting;
-	}
-
-	return;
-	if (selecting) {
+	// Update the displayed selected frequency
+	if (selecting_freq && freq_changed) {
+		freq_changed = false;
 		lcd.setCursor(0, 1);
-		lcd.print(fm_set_freq);
+		lcd.print(fm_sel_freq);
+		lcd.print(" MHz");
 	}
-	Serial.println(PINC);
-	if (!(PINC & (1 << FREQ_SEL_BTN))) {
-		delay(1000);
-		selecting = !selecting;
 
-		if (selecting) {
-			lcd.clear();
-			lcd.setCursor(0, 0);
-			lcd.print("Select Frequency");
-		} else {
-			fmtx_set_freq(fm_set_freq);
-			print_freq_banner();
-		}
-
-		return;
-	}
-	if (selecting) {
-		int value = analogRead(FREQUENCY_PIN);
-		if (value < MIN_FREQ_ADC_READ) {
-			value = MIN_FREQ;
-		} else if (value > MAX_FREQ_ADC_READ) {
-			value = MAX_FREQ;
-		} else {
-			value = map(value, MIN_FREQ_ADC_READ, MAX_FREQ_ADC_READ, MIN_FREQ,
-						MAX_FREQ);
-		}
-
-		samples[collected++] = value;
-		if (collected * sizeof(*samples) > sizeof(samples)) {
-			long sum = 0;
-			for (int i = 0; i < sizeof(samples) / sizeof(*samples); i++) {
-				sum += samples[i];
-			}
-			value = (float)sum / (sizeof(samples) / sizeof(*samples));
-			collected = 0;
-		}
-
-		fm_set_freq = value / 10.0; // Convert to MHz
-	}
+	enum button_state state = handle_button_input();
+	if (state == PRESS)
+		toggle_freq_sel();
+	else if (state == HOLD)
+		switch_play_mode();
 }
